@@ -1,0 +1,39 @@
+.lux-shell {
+  max-width: 1620px;
+  margin: 0 auto;
+}
+
+.lux-shell .ant-card {
+  border-radius: 20px;
+  border: 1px solid #e9eefc;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+}
+
+.lux-shell .ant-card .ant-card-head {
+  border-bottom: 1px solid #edf2ff;
+}
+
+.lux-shell .ant-btn-primary {
+  border-radius: 10px;
+  border: none;
+  background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
+  box-shadow: 0 8px 18px rgba(79, 70, 229, 0.24);
+}
+
+.lux-shell .ant-tag {
+  border-radius: 8px;
+}
+
+.lux-shell .ant-table-wrapper .ant-table {
+  border-radius: 14px;
+}
+
+.lux-shell .ant-table-thead > tr > th {
+  background: #f8faff;
+  color: #334155;
+  font-weight: 700;
+}
+
+.lux-shell .ant-segmented {
+  background: #eef2ff;
+}

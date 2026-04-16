@@ -1,0 +1,420 @@
+// ─── Design Tokens ─────────────────────────────────────────────────────────────
+@primary-color: #6366f1;
+@primary-hover: #4f46e5;
+@bg-sider: #ffffff;
+@text-main: #1e293b;
+@text-secondary: #64748b;
+@menu-item-hover: rgba(99, 102, 241, 0.04);
+@menu-item-active: rgba(99, 102, 241, 0.08);
+@border-color: #f1f5f9;
+@shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+@shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+
+// ─── MainLayout ───────────────────────────────────────────────────────────────
+.mainLayout {
+  height: 100vh;
+  background: #f8fafc;
+}
+
+.pageContainer {
+  padding: 20px;
+  background: transparent;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.contentLayout {
+  min-height: 0;
+  overflow: hidden;
+}
+
+:global {
+  .page-container {
+    background: transparent !important;
+  }
+  .page-content {
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: @shadow-sm;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid @border-color;
+  }
+}
+
+// ─── Header ───────────────────────────────────────────────────────────────────
+.header {
+  height: 64px;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid @border-color;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  box-shadow: @shadow-sm;
+}
+
+.headerEmployee {
+  justify-content: space-between;
+}
+
+.headerLeft {
+  display: flex;
+  align-items: center;
+  min-width: 220px;
+}
+
+.headerTitleLeft {
+  font-size: 16px;
+  font-weight: 700;
+  color: @text-main;
+  letter-spacing: -0.025em;
+  font-family: "Inter", sans-serif;
+  white-space: nowrap;
+  background: linear-gradient(135deg, #1e293b 0%, #475569 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.headerBrand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.headerLogo {
+  height: 28px;
+  max-width: min(44vw, 360px);
+  width: auto;
+  object-fit: contain;
+  transition: transform 0.3s ease;
+  &:hover {
+    transform: scale(1.05);
+  }
+}
+
+// ─── Sidebar ──────────────────────────────────────────────────────────────────
+.sider {
+  background: linear-gradient(180deg, #fcfdff 0%, #f8fbff 100%) !important;
+  border-right: 1px solid rgba(226, 232, 240, 0.9);
+  box-shadow: 10px 0 30px rgba(15, 23, 42, 0.06);
+  height: 100vh;
+  z-index: 101;
+
+  :global {
+    .ant-layout-sider-children {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
+      padding: 12px 10px 14px;
+      gap: 10px;
+    }
+
+    .ant-menu {
+      border-inline-end: 0 !important;
+      background: transparent !important;
+      padding: 0 6px 12px;
+      height: auto;
+      overflow: visible;
+    }
+
+    .ant-menu-inline-collapsed {
+      width: 100% !important;
+    }
+
+    .ant-menu-item-group-title {
+      font-size: 11px !important;
+      font-weight: 700 !important;
+      color: #94a3b8 !important;
+      text-transform: uppercase !important;
+      letter-spacing: 0.08em !important;
+      padding: 18px 14px 8px !important;
+    }
+
+    .ant-menu-item,
+    .ant-menu-submenu-title {
+      min-height: 46px !important;
+      line-height: 46px !important;
+      margin: 4px 0 !important;
+      border-radius: 14px !important;
+      color: @text-secondary !important;
+      transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    }
+
+    .ant-menu-item {
+      height: auto !important;
+      white-space: normal;
+    }
+
+    .ant-menu-item:hover,
+    .ant-menu-submenu-title:hover {
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.08) 0%, rgba(129, 140, 248, 0.1) 100%) !important;
+      color: @primary-color !important;
+      transform: translateX(2px);
+    }
+
+    .ant-menu-item-selected {
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.14) 0%, rgba(129, 140, 248, 0.16) 100%) !important;
+      color: @primary-color !important;
+      font-weight: 700 !important;
+      box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.12);
+    }
+
+    .ant-menu-item-selected::after {
+      display: none !important;
+    }
+
+    .ant-menu-item-icon,
+    .ant-menu-submenu-title .ant-menu-item-icon {
+      font-size: 18px !important;
+      margin-right: 12px !important;
+      color: currentColor !important;
+    }
+
+    .ant-menu-submenu-selected > .ant-menu-submenu-title {
+      color: @primary-color !important;
+      font-weight: 600 !important;
+    }
+
+    .ant-menu-sub.ant-menu-inline {
+      margin: 6px 0 12px;
+      padding: 8px !important;
+      background: rgba(255, 255, 255, 0.78) !important;
+      border: 1px solid rgba(226, 232, 240, 0.85);
+      border-radius: 18px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    }
+
+    .ant-menu-submenu-arrow {
+      color: #94a3b8;
+    }
+
+    .ant-menu-submenu-popup .ant-menu {
+      background: rgba(255, 255, 255, 0.98) !important;
+      border: 1px solid rgba(226, 232, 240, 0.95);
+      border-radius: 18px;
+      box-shadow: 0 20px 48px rgba(15, 23, 42, 0.14);
+      padding: 10px !important;
+      backdrop-filter: blur(14px);
+    }
+  }
+}
+
+.siderTop {
+  min-height: 74px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px 2px;
+  overflow: hidden;
+}
+
+.siderMenuWrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  border-radius: 22px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(248, 250, 252, 0.9) 100%);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(99, 102, 241, 0.36) transparent;
+}
+
+.siderMenuWrap::-webkit-scrollbar {
+  width: 8px;
+}
+
+.siderMenuWrap::-webkit-scrollbar-thumb {
+  background: rgba(99, 102, 241, 0.32);
+  border-radius: 999px;
+}
+
+.siderMenuWrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.siderMenu {
+  min-height: 100%;
+}
+
+.logoWrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  cursor: pointer;
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.08) 0%, rgba(99, 102, 241, 0.03) 100%);
+  border: 1px solid rgba(99, 102, 241, 0.08);
+  transition: all 0.22s ease;
+
+  &:hover {
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.14) 0%, rgba(129, 140, 248, 0.08) 100%);
+    transform: translateY(-1px);
+  }
+}
+
+.logoImg {
+  display: block;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  max-width: 28px;
+  object-fit: contain;
+}
+
+.logoText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  line-height: 1.2;
+}
+
+.companyName {
+  font-size: 20px;
+  color: @primary-color;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  font-family: "Plus Jakarta Sans", "Inter", sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agentName {
+  font-size: 10px;
+  color: @text-secondary;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.collapseBtn {
+  flex: 0 0 40px;
+  margin-left: 0;
+  color: @text-secondary;
+  width: 40px !important;
+  height: 40px !important;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px !important;
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  background: rgba(255, 255, 255, 0.96) !important;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
+
+  &:hover {
+    background: rgba(238, 242, 255, 0.96) !important;
+    color: @primary-color !important;
+    border-color: rgba(129, 140, 248, 0.38);
+  }
+}
+
+.siderFooter {
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.08) 0%, rgba(129, 140, 248, 0.04) 100%);
+  border: 1px solid rgba(129, 140, 248, 0.12);
+}
+
+.siderFooterTitle {
+  font-size: 12px;
+  font-weight: 700;
+  color: #4338ca;
+  margin-bottom: 4px;
+}
+
+.siderFooterText {
+  font-size: 12px;
+  line-height: 1.55;
+  color: #64748b;
+}
+
+// ─── Update Modal ─────────────────────────────────────────────────────────────
+.updateModalTitle {
+  color: #615ced;
+}
+
+.updateModalBody {
+  max-height: 480px;
+  overflow-y: auto;
+  padding: 8px 4px;
+  min-height: 120px;
+}
+
+.updateModalSpinWrapper {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 120px;
+}
+
+.updateModalPrimaryBtn {
+  background: #615ced;
+  border-color: #615ced;
+}
+
+// ─── Code block inside update modal ──────────────────────────────────────────
+.codeBlock {
+  position: relative;
+  background: #f5f5f5;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  padding: 12px 40px 12px 16px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.codeBlockInner {
+  font-family: monospace;
+  font-size: 13px;
+}
+
+.codeInline {
+  background: #f5f5f5;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: monospace;
+  font-size: 13px;
+}
+
+// ─── CopyButton ───────────────────────────────────────────────────────────────
+.copyBtn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  transition: color 0.2s;
+}
+
+.copyBtnCopied {
+  color: #52c41a;
+}
+
+.copyBtnDefault {
+  color: #999;
+}

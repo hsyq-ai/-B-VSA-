@@ -1,0 +1,376 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import uuid
+from typing import Any
+
+from fastapi import WebSocket
+
+from ....agents.voice_secretary import VoiceSecretaryAgent
+from ...tts_client import TTSClient, get_tts_client
+from .duplug_client import DuplugClient
+from .session import VoiceSecretarySession, VoiceSecretarySessionManager
+
+logger = logging.getLogger(__name__)
+
+
+class VoiceSecretaryHandler:
+    FALLBACK_IDLE_STREAK = 10
+    FALLBACK_STAGNANT_TURNS = 18
+
+    def __init__(
+        self,
+        *,
+        ws: WebSocket,
+        current_user: dict[str, Any],
+        duplug_client: DuplugClient,
+        session_mgr: VoiceSecretarySessionManager,
+    ) -> None:
+        self.ws = ws
+        self.current_user = dict(current_user or {})
+        self.duplug_client = duplug_client
+        self.session_mgr = session_mgr
+        self.user_id = str(self.current_user.get("user_id") or "").strip()
+        self.agent_id = f"vsa:{self.user_id}"
+        self.session: VoiceSecretarySession | None = None
+        self.tts_client: TTSClient = get_tts_client()
+        self._send_lock = asyncio.Lock()
+        self._tts_task: asyncio.Task[None] | None = None
+        self._tts_request_id = ""
+        self._closed = False
+
+    async def _send_json(self, payload: dict[str, Any]) -> None:
+        if self._closed:
+            return
+        async with self._send_lock:
+            await self.ws.send_json(payload)
+
+    async def _send_status(self, phase: str, text: str) -> None:
+        await self._send_json(
+            {
+                "type": "assistant_status",
+                "phase": str(phase or "processing"),
+                "text": str(text or ""),
+                "sessionId": str(self.session.session_id if self.session else ""),
+            }
+        )
+
+    async def _send_audio_event(self, event_type: str, request_id: str, **payload: Any) -> None:
+        if self.session is None or not request_id:
+            return
+        await self._send_json(
+            {
+                "type": event_type,
+                "sessionId": self.session.session_id,
+                "requestId": request_id,
+                **payload,
+            }
+        )
+
+    def _extract_turn_text(self, turn_state: dict[str, Any]) -> str:
+        return str(turn_state.get("text") or turn_state.get("asr_buffer") or turn_state.get("asr_segment") or "").strip()
+
+    def _should_fallback_commit(self, *, state_name: str, candidate_text: str) -> bool:
+        if self.session is None or not candidate_text or bool(self.session.processing):
+            return False
+        if candidate_text == self.session.last_committed_text:
+            return False
+        if state_name == "idle" and self.session.idle_streak >= self.FALLBACK_IDLE_STREAK:
+            return True
+        return self.session.stagnant_turn_count >= self.FALLBACK_STAGNANT_TURNS
+
+    async def _interrupt_tts(self, reason: str, *, notify_client: bool = True) -> None:
+        task = self._tts_task
+        request_id = self._tts_request_id
+        if not task or task.done() or not request_id:
+            self._tts_task = None
+            self._tts_request_id = ""
+            if self.session is not None:
+                self.session = self.session_mgr.update_session(
+                    self.session.session_id,
+                    current_tts_request_id="",
+                ) or self.session
+            return
+        if notify_client:
+            await self._send_audio_event("assistant_audio_interrupt", request_id, reason=str(reason or "interrupted"))
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._tts_task = None
+        self._tts_request_id = ""
+        if self.session is not None:
+            self.session = self.session_mgr.update_session(
+                self.session.session_id,
+                current_tts_request_id="",
+            ) or self.session
+
+    async def _synthesize_tts_streaming(self, *, request_id: str, text: str) -> None:
+        """流式 TTS：逐块推送 PCM 音频到前端，首块延迟低。"""
+        if self.session is None:
+            return
+        try:
+            logger.info("TTS stream start user=%s provider=%s text=%s", self.user_id, self.tts_client.provider, text[:80])
+            await self._send_status("synthesizing", "正在合成语音...")
+            self.session = self.session_mgr.update_session(
+                self.session.session_id,
+                status="speaking",
+                processing=False,
+                current_tts_request_id=request_id,
+            ) or self.session
+            first_chunk = True
+            async for event in self.tts_client.stream_synthesize(text):
+                if self._closed or self._tts_request_id != request_id:
+                    return
+                if event.get("event") == "start":
+                    await self._send_audio_event("assistant_audio_stream_start", request_id, audio=event)
+                    continue
+                if event.get("event") == "chunk":
+                    if first_chunk:
+                        logger.info("TTS stream first chunk user=%s seq=%s", self.user_id, event.get("seq"))
+                        first_chunk = False
+                    await self._send_audio_event("assistant_audio_stream_chunk", request_id, audio=event)
+                    continue
+                if event.get("event") == "end":
+                    await self._send_audio_event("assistant_audio_stream_end", request_id)
+                    continue
+                if event.get("event") == "error":
+                    await self._send_audio_event("assistant_audio_error", request_id, error=str(event.get("error", "stream synthesis failed")))
+            logger.info("TTS stream done user=%s", self.user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("VoiceSecretary stream tts failed user=%s", self.user_id)
+            await self._send_audio_event("assistant_audio_error", request_id, error=str(exc or "tts stream failed"))
+        finally:
+            if self.session is not None and self._tts_request_id == request_id:
+                next_status = self.session.status
+                if next_status == "speaking":
+                    next_status = "idle"
+                self.session = self.session_mgr.update_session(
+                    self.session.session_id,
+                    status=next_status,
+                    current_tts_request_id="",
+                ) or self.session
+                self._tts_request_id = ""
+                self._tts_task = None
+
+    async def _start_tts_response(self, spoken_text: str) -> None:
+        if self.session is None or not spoken_text:
+            logger.info("TTS skip session=%s text=%s", bool(self.session), spoken_text[:60] if spoken_text else "")
+            return
+        logger.info("TTS start response user=%s text=%s", self.user_id, spoken_text[:80])
+        await self._interrupt_tts("superseded_by_new_result")
+        request_id = f"tts-{uuid.uuid4().hex[:10]}"
+        self._tts_request_id = request_id
+        self.session = self.session_mgr.update_session(
+            self.session.session_id,
+            current_tts_request_id=request_id,
+        ) or self.session
+        self._tts_task = asyncio.create_task(self._synthesize_tts_streaming(request_id=request_id, text=spoken_text))
+
+    async def _handle_turn_state(self, response: dict[str, Any]) -> None:
+        if self.session is None:
+            return
+        turn_state = response.get("state") if isinstance(response.get("state"), dict) else {}
+        state_name = str(turn_state.get("state") or "idle")
+        if state_name != "idle" and self._tts_task and not self._tts_task.done():
+            await self._interrupt_tts("user_barge_in")
+        observed_text = self._extract_turn_text(turn_state)
+        candidate_text = observed_text or self.session.last_candidate_text
+        stagnant_turn_count = 0
+        if candidate_text:
+            stagnant_turn_count = self.session.stagnant_turn_count + 1 if candidate_text == self.session.last_candidate_text else 1
+        idle_streak = self.session.idle_streak + 1 if state_name == "idle" and candidate_text else 0
+        self.session = self.session_mgr.update_session(
+            self.session.session_id,
+            status=state_name,
+            last_candidate_text=candidate_text,
+            stagnant_turn_count=stagnant_turn_count,
+            idle_streak=idle_streak,
+            last_turn_state=turn_state,
+        ) or self.session
+        await self._send_json(
+            {
+                "type": "turn_state",
+                "sessionId": self.session.session_id,
+                "turnState": turn_state,
+            }
+        )
+        if state_name == "speak":
+            text = candidate_text
+            if text and not bool(self.session.processing):
+                await self._process_turn(text=text, turn_state=turn_state)
+            return
+        if self._should_fallback_commit(state_name=state_name, candidate_text=candidate_text):
+            logger.info(
+                "VoiceSecretary fallback commit user=%s session=%s state=%s idle_streak=%s stagnant_turns=%s text=%s",
+                self.user_id,
+                self.session.session_id,
+                state_name,
+                self.session.idle_streak,
+                self.session.stagnant_turn_count,
+                candidate_text[:120],
+            )
+            fallback_turn_state = dict(turn_state or {})
+            fallback_turn_state.setdefault("text", candidate_text)
+            fallback_turn_state["fallback_commit"] = True
+            await self._process_turn(text=candidate_text, turn_state=fallback_turn_state)
+
+    async def _process_turn(self, *, text: str, turn_state: dict[str, Any]) -> None:
+        if self.session is None:
+            return
+        await self._interrupt_tts("superseded_by_new_turn")
+        agent = VoiceSecretaryAgent(
+            request_context=self.ws,
+            current_user=self.current_user,
+            session_id=self.session.session_id,
+        )
+        # 极短文本/空文本快速过滤（性能优化，避免对 ASR 噪声调 LLM）
+        if agent.should_ignore_utterance(text):
+            logger.info(
+                "VSA quick-filter: user=%s session=%s text=%s",
+                self.user_id,
+                self.session.session_id,
+                str(text or "")[:120],
+            )
+            self.session = self.session_mgr.update_session(
+                self.session.session_id,
+                status="idle",
+                processing=False,
+                last_candidate_text=text,
+                last_committed_text=text,
+                stagnant_turn_count=0,
+                idle_streak=0,
+                last_turn_state=turn_state,
+            ) or self.session
+            await self._send_json(
+                {
+                    "type": "assistant_ignored",
+                    "sessionId": self.session.session_id,
+                    "originalText": str(text or ""),
+                }
+            )
+            return
+        self.session = self.session_mgr.update_session(
+            self.session.session_id,
+            status="processing",
+            processing=True,
+            last_user_text=text,
+            last_candidate_text=text,
+            last_committed_text=text,
+            stagnant_turn_count=0,
+            idle_streak=0,
+            last_turn_state=turn_state,
+        ) or self.session
+        await self._send_status("processing", "语音秘书正在理解你的意图...")
+        try:
+            result = await agent.process_voice_command(
+                text,
+                {
+                    "duplug_state": turn_state,
+                    "session_id": self.session.session_id,
+                    "agent_id": self.agent_id,
+                },
+            )
+        except Exception as exc:
+            logger.exception("VSA process failed user=%s", self.user_id)
+            self.session = self.session_mgr.update_session(
+                self.session.session_id,
+                status="error",
+                processing=False,
+            ) or self.session
+            await self._send_json(
+                {
+                    "type": "assistant_error",
+                    "sessionId": self.session.session_id,
+                    "error": str(exc or "Voice secretary processing failed"),
+                }
+            )
+            return
+        spoken = str(result.spoken or "").strip()
+        route_result = str(result.route_result or "")
+        # VSA 自己处理的（greeting/chat/self_handle）→ 不进聊天区，只语音播报
+        is_vsa_handled = route_result == "vsa_handled"
+        self.session = self.session_mgr.update_session(
+            self.session.session_id,
+            status="idle" if is_vsa_handled or not spoken else "processing",
+            processing=False,
+            last_screen=result.screen,
+            last_spoken=spoken,
+        ) or self.session
+        await self._send_json(
+            {
+                "type": "assistant_result",
+                "sessionId": self.session.session_id,
+                **result.to_dict(),
+            }
+        )
+        if spoken:
+            await self._start_tts_response(spoken)
+
+    async def _handle_text_payload(self, raw: str) -> None:
+        try:
+            payload = json.loads(raw or "{}")
+        except Exception:
+            await self._send_json({"type": "assistant_error", "error": "Invalid JSON payload"})
+            return
+        message_type = str(payload.get("type") or "").strip()
+        if message_type == "ping":
+            await self._send_json({"type": "pong"})
+            return
+        if message_type not in {"audio_chunk", "audio"}:
+            return
+        audio = str(payload.get("audio") or "").strip()
+        if not audio or self.session is None:
+            return
+        response = await self.duplug_client.feed_audio(session_id=self.session.session_id, audio_base64=audio)
+        if response:
+            await self._handle_turn_state(response)
+
+    async def _send_greeting(self) -> None:
+        """连接建立后，VSA 主动问候用户。"""
+        try:
+            agent = VoiceSecretaryAgent(
+                request_context=self.ws,
+                current_user=self.current_user,
+                session_id=self.session.session_id if self.session else "",
+            )
+            greeting = await agent.generate_greeting()
+            if greeting and self.session:
+                await self._send_json(
+                    {
+                        "type": "assistant_greeting",
+                        "sessionId": self.session.session_id,
+                        "spoken": greeting,
+                    }
+                )
+                await self._start_tts_response(greeting)
+        except Exception as exc:
+            logger.warning("VSA greeting failed: user=%s err=%s", self.user_id, exc)
+
+    async def handle(self) -> None:
+        self.session = self.session_mgr.create_session(user_id=self.user_id, agent_id=self.agent_id)
+        await self._send_json(
+            {
+                "type": "ready",
+                "sessionId": self.session.session_id,
+                "agentId": self.agent_id,
+            }
+        )
+        # 主动问候
+        await self._send_greeting()
+        while True:
+            raw = await self.ws.receive_text()
+            await self._handle_text_payload(raw)
+
+    async def close(self) -> None:
+        if self.session is None:
+            return
+        await self._interrupt_tts("session_closed", notify_client=False)
+        self._closed = True
+        await self.duplug_client.close_session(self.session.session_id)
+        self.session_mgr.end_session(self.session.session_id)

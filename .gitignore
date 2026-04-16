@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+
+# Node
+node_modules/
+console/node_modules/
+console/dist/
+website/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime data
+*.db
+*.log
+logs/
+certs/
+downloads/
+
+# Secrets
+.env
+*.secret
+copaw_work.secret/
+copaw_work/
+
+# Models
+redai_models/
+
+# Cache
+.pytest_cache/
+.mypy_cache/
+
+# Build artifacts
+*.zip
+paw_*.zip
+1.0.bak.zip
+
+# Backups
+bak/
+*.backup/
+CoPaw.backup_*/
+CoPaw.bak.*/
+
+# Temp
+sandbox/
+tmp/
