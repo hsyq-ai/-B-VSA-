@@ -22,6 +22,8 @@ class VoiceSecretarySession:
     stagnant_turn_count: int = 0
     idle_streak: int = 0
     current_tts_request_id: str = ""
+    greeted_once: bool = False
+    last_tts_end_at: float = 0.0
     last_turn_state: dict[str, Any] = field(default_factory=dict)
     last_screen: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
@@ -62,6 +64,8 @@ class VoiceSecretarySessionManager:
         stagnant_turn_count: int | None = None,
         idle_streak: int | None = None,
         current_tts_request_id: str | None = None,
+        greeted_once: bool | None = None,
+        last_tts_end_at: float | None = None,
         last_turn_state: dict[str, Any] | None = None,
         last_screen: dict[str, Any] | None = None,
         last_spoken: str | None = None,
@@ -86,6 +90,10 @@ class VoiceSecretarySessionManager:
                 session.idle_streak = max(int(idle_streak), 0)
             if current_tts_request_id is not None:
                 session.current_tts_request_id = str(current_tts_request_id or "")
+            if greeted_once is not None:
+                session.greeted_once = bool(greeted_once)
+            if last_tts_end_at is not None:
+                session.last_tts_end_at = max(float(last_tts_end_at), 0.0)
             if last_turn_state is not None:
                 session.last_turn_state = dict(last_turn_state or {})
             if last_screen is not None:

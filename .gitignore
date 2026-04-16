@@ -14,6 +14,9 @@ console/node_modules/
 console/dist/
 website/node_modules/
 
+# Console build output (vite builds to src/copaw/console/)
+src/copaw/console/
+
 # IDE
 .vscode/
 .idea/

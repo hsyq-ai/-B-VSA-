@@ -948,7 +948,23 @@ async def pull_messages(current_user: dict = Depends(get_current_user)):
                         )
                         memories = state.get("agent", {}).get("memory", {})
                         memory = InMemoryMemory()
-                        memory.load_state_dict(memories)
+                        if isinstance(memories, dict) and "content" in memories:
+                            try:
+                                memory.load_state_dict(memories)
+                            except Exception:
+                                logger.warning(
+                                    "Ignore invalid memory state for session=%s user=%s",
+                                    push_session_id,
+                                    user_id,
+                                    exc_info=True,
+                                )
+                        elif memories:
+                            logger.warning(
+                                "Skip incompatible memory state for session=%s user=%s keys=%s",
+                                push_session_id,
+                                user_id,
+                                list(memories.keys()) if isinstance(memories, dict) else type(memories).__name__,
+                            )
                         message_id = str(msg.get("message_id") or "")
                         already = False
                         if message_id:

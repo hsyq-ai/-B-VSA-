@@ -5,6 +5,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import time
 import uuid
 from typing import Any
 
@@ -21,6 +23,28 @@ logger = logging.getLogger(__name__)
 class VoiceSecretaryHandler:
     FALLBACK_IDLE_STREAK = 10
     FALLBACK_STAGNANT_TURNS = 18
+    FALLBACK_MIN_TEXT_LEN = 3
+    FALLBACK_FILTER_WORDS = {
+        "嗯",
+        "嗯嗯",
+        "啊",
+        "哦",
+        "喂",
+        "对",
+        "对呀",
+        "对啊",
+        "好的",
+        "没事",
+        "行",
+        "可以",
+        "是吗",
+        "什么",
+        "什么啊",
+    }
+    PROCESS_TIMEOUT_SECONDS = max(
+        float(os.getenv("COPAW_VSA_PROCESS_TIMEOUT_SECONDS", "12.0") or 12.0),
+        3.0,
+    )
 
     def __init__(
         self,
@@ -42,6 +66,13 @@ class VoiceSecretaryHandler:
         self._tts_task: asyncio.Task[None] | None = None
         self._tts_request_id = ""
         self._closed = False
+        self._fallback_commit_enabled = str(
+            os.getenv("COPAW_VSA_FALLBACK_COMMIT_ENABLED", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._fallback_post_tts_guard_seconds = max(
+            float(os.getenv("COPAW_VSA_FALLBACK_POST_TTS_GUARD_SECONDS", "1.5") or 1.5),
+            0.0,
+        )
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         if self._closed:
@@ -74,11 +105,34 @@ class VoiceSecretaryHandler:
     def _extract_turn_text(self, turn_state: dict[str, Any]) -> str:
         return str(turn_state.get("text") or turn_state.get("asr_buffer") or turn_state.get("asr_segment") or "").strip()
 
+    @staticmethod
+    def _compact_text(value: str) -> str:
+        text = str(value or "").strip().lower()
+        return "".join(ch for ch in text if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"))
+
     def _should_fallback_commit(self, *, state_name: str, candidate_text: str) -> bool:
         if self.session is None or not candidate_text or bool(self.session.processing):
             return False
+        if not self._fallback_commit_enabled:
+            return False
         if candidate_text == self.session.last_committed_text:
             return False
+        if self._tts_task and not self._tts_task.done():
+            return False
+        if self.session.current_tts_request_id:
+            return False
+        post_tts_delta = time.time() - float(self.session.last_tts_end_at or 0.0)
+        if post_tts_delta >= 0 and post_tts_delta < self._fallback_post_tts_guard_seconds:
+            return False
+
+        compact = self._compact_text(candidate_text)
+        if not compact:
+            return False
+        if compact in self.FALLBACK_FILTER_WORDS:
+            return False
+        if len(compact) < self.FALLBACK_MIN_TEXT_LEN:
+            return False
+
         if state_name == "idle" and self.session.idle_streak >= self.FALLBACK_IDLE_STREAK:
             return True
         return self.session.stagnant_turn_count >= self.FALLBACK_STAGNANT_TURNS
@@ -154,6 +208,7 @@ class VoiceSecretaryHandler:
                     self.session.session_id,
                     status=next_status,
                     current_tts_request_id="",
+                    last_tts_end_at=time.time(),
                 ) or self.session
                 self._tts_request_id = ""
                 self._tts_task = None
@@ -266,16 +321,53 @@ class VoiceSecretaryHandler:
             idle_streak=0,
             last_turn_state=turn_state,
         ) or self.session
-        await self._send_status("processing", "语音秘书正在理解你的意图...")
+        await self._send_status("intent_classifying", "正在判断你的意图...")
         try:
-            result = await agent.process_voice_command(
-                text,
-                {
-                    "duplug_state": turn_state,
-                    "session_id": self.session.session_id,
-                    "agent_id": self.agent_id,
-                },
+            result = await asyncio.wait_for(
+                agent.process_voice_command(
+                    text,
+                    {
+                        "duplug_state": turn_state,
+                        "session_id": self.session.session_id,
+                        "agent_id": self.agent_id,
+                    },
+                ),
+                timeout=self.PROCESS_TIMEOUT_SECONDS,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "VSA process timeout user=%s session=%s timeout=%.2fs text=%s",
+                self.user_id,
+                self.session.session_id,
+                self.PROCESS_TIMEOUT_SECONDS,
+                str(text or "")[:120],
+            )
+            spoken = "我这次处理有点慢，先给你一个快速答复。你可以再说一遍：今天星期几。"
+            self.session = self.session_mgr.update_session(
+                self.session.session_id,
+                status="idle",
+                processing=False,
+                last_spoken=spoken,
+            ) or self.session
+            await self._send_json(
+                {
+                    "type": "assistant_result",
+                    "sessionId": self.session.session_id,
+                    "spoken": spoken,
+                    "screen": {
+                        "kind": "voice_secretary_result",
+                        "title": "语音秘书回复",
+                        "summary": spoken,
+                        "originalText": str(text or ""),
+                        "intent": "chat",
+                    },
+                    "route_result": "vsa_handled",
+                    "target_agent_id": self.agent_id,
+                }
+            )
+            await self._send_status("result_ready", "已生成结果，准备播报...")
+            await self._start_tts_response(spoken)
+            return
         except Exception as exc:
             logger.exception("VSA process failed user=%s", self.user_id)
             self.session = self.session_mgr.update_session(
@@ -293,6 +385,11 @@ class VoiceSecretaryHandler:
             return
         spoken = str(result.spoken or "").strip()
         route_result = str(result.route_result or "")
+        if route_result == "vsa_handled":
+            await self._send_status("generating_reply", "正在生成回复...")
+        else:
+            await self._send_status("task_handoff", "任务已接管，正在分发...")
+            await self._send_status("task_executing", "任务执行中，正在整理结果...")
         # VSA 自己处理的（greeting/chat/self_handle）→ 不进聊天区，只语音播报
         is_vsa_handled = route_result == "vsa_handled"
         self.session = self.session_mgr.update_session(
@@ -309,6 +406,7 @@ class VoiceSecretaryHandler:
                 **result.to_dict(),
             }
         )
+        await self._send_status("result_ready", "已生成结果，准备播报...")
         if spoken:
             await self._start_tts_response(spoken)
 
@@ -322,6 +420,9 @@ class VoiceSecretaryHandler:
         if message_type == "ping":
             await self._send_json({"type": "pong"})
             return
+        if message_type == "activate":
+            await self._handle_activate()
+            return
         if message_type not in {"audio_chunk", "audio"}:
             return
         audio = str(payload.get("audio") or "").strip()
@@ -332,7 +433,7 @@ class VoiceSecretaryHandler:
             await self._handle_turn_state(response)
 
     async def _send_greeting(self) -> None:
-        """连接建立后，VSA 主动问候用户。"""
+        """按需发送 VSA 问候语。"""
         try:
             agent = VoiceSecretaryAgent(
                 request_context=self.ws,
@@ -352,6 +453,18 @@ class VoiceSecretaryHandler:
         except Exception as exc:
             logger.warning("VSA greeting failed: user=%s err=%s", self.user_id, exc)
 
+    async def _handle_activate(self) -> None:
+        """前端激活信号：仅首次激活时问候。"""
+        if self.session is None:
+            return
+        if bool(self.session.greeted_once):
+            return
+        self.session = self.session_mgr.update_session(
+            self.session.session_id,
+            greeted_once=True,
+        ) or self.session
+        await self._send_greeting()
+
     async def handle(self) -> None:
         self.session = self.session_mgr.create_session(user_id=self.user_id, agent_id=self.agent_id)
         await self._send_json(
@@ -361,8 +474,6 @@ class VoiceSecretaryHandler:
                 "agentId": self.agent_id,
             }
         )
-        # 主动问候
-        await self._send_greeting()
         while True:
             raw = await self.ws.receive_text()
             await self._handle_text_payload(raw)

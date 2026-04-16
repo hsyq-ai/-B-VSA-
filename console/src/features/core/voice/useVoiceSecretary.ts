@@ -50,6 +50,33 @@ const base64ToUint8Array = (input: string) => {
 const SPEECH_CAPTURE_COOLDOWN_MS = 600;
 const AUDIO_PLAYBACK_WATCHDOG_MS = 15000;
 const AUTO_SLEEP_MS = 30_000;
+const PROCESSING_WATCHDOG_MS = 35_000;
+
+const mapAssistantPhaseToStatusText = (phase: string, fallbackText: string) => {
+  const normalized = String(phase || "").trim();
+  if (normalized === "intent_classifying") {
+    return { status: "processing" as const, text: "正在判断你的意图..." };
+  }
+  if (normalized === "task_handoff") {
+    return { status: "processing" as const, text: "任务已接管，正在分发..." };
+  }
+  if (normalized === "task_executing") {
+    return { status: "processing" as const, text: "任务执行中，正在整理结果..." };
+  }
+  if (normalized === "generating_reply") {
+    return { status: "processing" as const, text: "正在生成回复..." };
+  }
+  if (normalized === "result_ready") {
+    return { status: "processing" as const, text: "已生成结果，准备播报..." };
+  }
+  if (normalized === "synthesizing") {
+    return { status: "speaking" as const, text: "语音秘书正在合成语音..." };
+  }
+  return {
+    status: "processing" as const,
+    text: String(fallbackText || "语音秘书正在处理当前请求...").trim(),
+  };
+};
 
 export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions) {
   const supported = useMemo(
@@ -83,6 +110,8 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
   const streamActiveReqIdRef = useRef("");
   // 记录流式音频首块到达时间，用于计算总播放时长
   const streamStartTimeRef = useRef(0);
+  const processingWatchdogTimerRef = useRef<number | null>(null);
+  const pendingActivateSignalRef = useRef(false);
 
   // ★ 激活状态控制：待命态不发音频，激活态正常拾音
   const [active, setActive] = useState(false);
@@ -121,6 +150,23 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
     }
   }, []);
 
+  const clearProcessingWatchdog = useCallback(() => {
+    if (processingWatchdogTimerRef.current) {
+      window.clearTimeout(processingWatchdogTimerRef.current);
+      processingWatchdogTimerRef.current = null;
+    }
+  }, []);
+
+  const armProcessingWatchdog = useCallback(() => {
+    clearProcessingWatchdog();
+    processingWatchdogTimerRef.current = window.setTimeout(() => {
+      setStatus("idle");
+      setStatusText(activeRef.current ? "语音秘书待命中（请说话）" : "语音秘书待命中（点击唤醒）");
+      setError("处理时间较长，已恢复监听，你可以重试或换种说法");
+      processingWatchdogTimerRef.current = null;
+    }, PROCESSING_WATCHDOG_MS);
+  }, [clearProcessingWatchdog]);
+
   const resetAutoSleepTimer = useCallback(() => {
     clearAutoSleepTimer();
     autoSleepTimerRef.current = window.setTimeout(() => {
@@ -138,11 +184,19 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
     setActive(true);
     setStatusText("语音秘书已激活，请说...");
     resetAutoSleepTimer();
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "activate" }));
+      pendingActivateSignalRef.current = false;
+    } else {
+      pendingActivateSignalRef.current = true;
+    }
   }, [resetAutoSleepTimer]);
 
   const deactivate = useCallback(() => {
     activeRef.current = false;
     setActive(false);
+    pendingActivateSignalRef.current = false;
     clearAutoSleepTimer();
     pendingBufferRef.current = new Float32Array();
     setStatus("idle");
@@ -185,6 +239,8 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
 
   const disconnectInternal = useCallback(async () => {
     cancelSpeech();
+    clearProcessingWatchdog();
+    pendingActivateSignalRef.current = false;
     pendingBufferRef.current = new Float32Array();
     startInFlightRef.current = false;
     capturePausedUntilRef.current = 0;
@@ -244,7 +300,7 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
       }
       wsRef.current = null;
     }
-  }, [cancelSpeech]);
+  }, [cancelSpeech, clearProcessingWatchdog]);
 
   const speakText = useCallback(
     (value: string) => {
@@ -371,8 +427,12 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
       if (type === "ready") {
         setConnected(true);
         setStatus("idle");
-        setStatusText("语音秘书已连接，点击唤醒开始");
+        setStatusText(activeRef.current ? "语音秘书待命中（请说话）" : "语音秘书已连接，点击唤醒开始");
         setError("");
+        if (activeRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: "activate" }));
+          pendingActivateSignalRef.current = false;
+        }
         return;
       }
 
@@ -394,6 +454,7 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
         }
         if (nextState === "speak") {
           cancelSpeech();
+          armProcessingWatchdog();
           setStatus("processing");
           setStatusText("正在理解你的语音请求...");
           setPartialTranscript(previewText);
@@ -429,8 +490,15 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
       }
 
       if (type === "assistant_status") {
-        setStatus("processing");
-        setStatusText(String(payload.text || "语音秘书正在处理当前请求...").trim());
+        const phase = String(payload.phase || "").trim();
+        const mapped = mapAssistantPhaseToStatusText(phase, String(payload.text || ""));
+        if (mapped.status === "processing") {
+          armProcessingWatchdog();
+        } else {
+          clearProcessingWatchdog();
+        }
+        setStatus(mapped.status);
+        setStatusText(mapped.text);
         return;
       }
 
@@ -448,6 +516,7 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
         if (resultKey && resultKey === lastAssistantResultKeyRef.current) {
           return;
         }
+        clearProcessingWatchdog();
         lastAssistantResultKeyRef.current = resultKey;
         setLastResult(result);
         setPartialTranscript("");
@@ -462,7 +531,7 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
           setStatusText("语音秘书正在播报结果...");
         } else if (!spoken) {
           setStatus("idle");
-          setStatusText(activeRef.current ? "语音秘书监听中" : "语音秘书待命中（点击唤醒）");
+          setStatusText(activeRef.current ? "语音秘书待命中（请说话）" : "语音秘书待命中（点击唤醒）");
         }
         // ★ 收到回复后重置自动休眠计时器
         if (activeRef.current) {
@@ -552,6 +621,26 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
         return;
       }
 
+      if (type === "assistant_audio_interrupt") {
+        clearProcessingWatchdog();
+        capturePausedUntilRef.current = Date.now() + SPEECH_CAPTURE_COOLDOWN_MS;
+        pendingBufferRef.current = new Float32Array();
+        setStatus("idle");
+        setStatusText(activeRef.current ? "语音秘书待命中（请说话）" : "语音秘书待命中（点击唤醒）");
+        return;
+      }
+
+      if (type === "assistant_audio_error") {
+        const nextError = String(payload.error || "语音播报异常").trim();
+        clearProcessingWatchdog();
+        capturePausedUntilRef.current = Date.now() + SPEECH_CAPTURE_COOLDOWN_MS;
+        pendingBufferRef.current = new Float32Array();
+        setError(nextError);
+        setStatus("idle");
+        setStatusText(activeRef.current ? "语音秘书待命中（播报异常）" : "语音秘书待命中（点击唤醒）");
+        return;
+      }
+
       // 兼容 blob 音频事件（非流式 fallback）
       if (type === "assistant_audio_blob") {
         const audio = (payload.audio || {}) as VoiceSecretaryAudioPayload;
@@ -561,6 +650,7 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
       }
 
       if (type === "assistant_ignored") {
+        clearProcessingWatchdog();
         const originalText = String(payload.originalText || "").trim();
         setPartialTranscript("");
         if (originalText) {
@@ -578,7 +668,7 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
         });
         setError("");
         setStatus("idle");
-        setStatusText(activeRef.current ? "语音秘书监听中" : "语音秘书待命中（点击唤醒）");
+        setStatusText(activeRef.current ? "语音秘书待命中（请说话）" : "语音秘书待命中（点击唤醒）");
         // ★ 收到忽略后也重置自动休眠计时器
         if (activeRef.current) {
           resetAutoSleepTimer();
@@ -588,12 +678,13 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
 
       if (type === "assistant_error") {
         const nextError = String(payload.error || "语音秘书链路异常").trim();
+        clearProcessingWatchdog();
         setError(nextError);
         setStatus("error");
         setStatusText(nextError || "语音秘书链路异常");
       }
     },
-    [cancelSpeech, playAudioPayload],
+    [armProcessingWatchdog, cancelSpeech, clearProcessingWatchdog, playAudioPayload],
   );
 
   const start = useCallback(async () => {
@@ -677,6 +768,9 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
           setConnected(true);
           setStatus("connecting");
           setStatusText("语音通道已建立，正在初始化...");
+          if (activeRef.current) {
+            pendingActivateSignalRef.current = true;
+          }
           resolve();
         };
         const handleError = () => {
@@ -754,8 +848,10 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
     setConnected(false);
     setStatus("idle");
     setStatusText("语音秘书已结束");
+    clearProcessingWatchdog();
+    pendingActivateSignalRef.current = false;
     await disconnectInternal();
-  }, [clearAutoSleepTimer, disconnectInternal]);
+  }, [clearAutoSleepTimer, clearProcessingWatchdog, disconnectInternal]);
 
   const reconnect = useCallback(async () => {
     await stop();

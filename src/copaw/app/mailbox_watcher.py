@@ -484,6 +484,16 @@ class MailboxWatcher:
         # ---- VSA 任务特殊路径：执行并返回结果，而不是只发回执 ----
         intent = str(envelope.get("intent") or "")
         if intent.startswith("vsa."):
+            source_agent_id = str(envelope.get("from_agent_id") or envelope.get("source_agent_id") or "").strip()
+            source_user_id = str(envelope.get("source_user_id") or "").strip()
+            # 主路径改为前端 iframe 注入执行：用户自有 VSA -> PIA 的任务由前端接管。
+            if source_agent_id.startswith("vsa:") and source_user_id and source_user_id == self._owner_user_id:
+                self._append_receipt(
+                    envelope,
+                    status="skipped",
+                    note="VSA 任务已由前端红智秘书会话接管，后端 watcher 跳过执行。",
+                )
+                return
             await self._handle_vsa_task(envelope)
             return
 
@@ -839,6 +849,7 @@ class MailboxWatcher:
                 # 首次启动从末尾开始，避免重放历史消息
                 offset = file_size
             if offset == file_size:
+                state.inbox_offset = file_size
                 state.last_inbox_size = file_size
                 return
 

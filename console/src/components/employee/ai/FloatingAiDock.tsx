@@ -207,8 +207,9 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
       case "listening": return "正在听...";
       case "processing": return "处理中...";
       case "speaking": return "播报中...";
+      case "idle": return "待命中";
       case "error": return "异常";
-      default: return "监听中";
+      default: return "待命中";
     }
   }, [voiceActive, voiceConnected, voiceListening, voiceStatus]);
 
@@ -1039,8 +1040,9 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
               className={`${styles.avatarButton} ${voiceActive ? styles.voiceAvatarButtonActive : ""}`.trim()}
               onClick={() => {
                 if (!voiceActive) {
-                  // 未连接 → 建立连接
+                  // 一次点击即连接并唤醒
                   setVoiceActive(true);
+                  voiceActivate();
                   void voiceStart();
                 } else if (!voiceListening) {
                   // 已连接但未激活 → 唤醒拾音

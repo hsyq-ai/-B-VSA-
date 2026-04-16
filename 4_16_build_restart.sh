@@ -84,8 +84,9 @@ else
   npm install --prefer-offline 2>&1 | tail -3
   echo "  npm run build..."
   npm run build 2>&1 | tail -5
-  if [ ! -d "$CONSOLE_DIR/dist" ]; then
-    echo "  ❌ 前端构建失败, dist 目录不存在!"
+  # 构建产物可能输出到 console/dist 或 src/copaw/console（取决于 vite config）
+  if [ ! -d "$CONSOLE_DIR/dist" ] && [ ! -d "$ROOT_DIR/src/copaw/console" ]; then
+    echo "  ❌ 前端构建失败, 构建产物目录不存在!"
     exit 1
   fi
   echo "  ✓ 前端构建完成"

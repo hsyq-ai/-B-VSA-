@@ -1,1 +1,0 @@
-const a=r=>{if(typeof window>"u")return[];try{const t=localStorage.getItem(r);if(!t)return[];const e=JSON.parse(t);return Array.isArray(e)?e:[]}catch{return[]}},n=(r,t)=>{typeof window>"u"||localStorage.setItem(r,JSON.stringify(t))};export{a as l,n as s};
