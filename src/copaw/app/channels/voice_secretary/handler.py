@@ -423,6 +423,9 @@ class VoiceSecretaryHandler:
         if message_type == "activate":
             await self._handle_activate()
             return
+        if message_type == "proactive_event":
+            await self._handle_proactive_event(payload)
+            return
         if message_type not in {"audio_chunk", "audio"}:
             return
         audio = str(payload.get("audio") or "").strip()
@@ -431,6 +434,59 @@ class VoiceSecretaryHandler:
         response = await self.duplug_client.feed_audio(session_id=self.session.session_id, audio_base64=audio)
         if response:
             await self._handle_turn_state(response)
+
+    async def _handle_proactive_event(self, payload: dict[str, Any]) -> None:
+        if self.session is None:
+            return
+        event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+        title = str(event.get("title") or "新消息提醒").strip() or "新消息提醒"
+        summary = str(event.get("summary") or "").strip()
+        source = str(event.get("source") or "系统").strip() or "系统"
+        level = str(event.get("level") or "light").strip().lower()
+        actions = event.get("actions") if isinstance(event.get("actions"), list) else []
+        action_labels = [str(item).strip() for item in actions if str(item or "").strip()]
+        if not action_labels:
+            action_labels = ["立即处理", "稍后提醒", "静默归档"]
+
+        if summary:
+            spoken = f"收到来自{source}的新提醒。{summary}"
+        else:
+            spoken = f"收到来自{source}的新提醒。"
+        if level == "silent":
+            spoken = ""
+
+        await self._send_status("proactive_notify", "收到新的提醒事件，正在整理播报...")
+        result_payload = {
+            "spoken": spoken,
+            "route_result": "vsa_handled",
+            "target_agent_id": self.agent_id,
+            "screen": {
+                "kind": "voice_secretary_proactive",
+                "title": title,
+                "summary": summary or "你可以选择立即处理、稍后提醒或静默归档。",
+                "source": source,
+                "level": level,
+                "quickActions": action_labels,
+                "originalText": "",
+            },
+        }
+        self.session = self.session_mgr.update_session(
+            self.session.session_id,
+            status="idle" if not spoken else "processing",
+            processing=False,
+            last_spoken=spoken,
+            last_screen=result_payload.get("screen") if isinstance(result_payload.get("screen"), dict) else {},
+        ) or self.session
+        await self._send_json(
+            {
+                "type": "assistant_result",
+                "sessionId": self.session.session_id,
+                **result_payload,
+            }
+        )
+        await self._send_status("result_ready", "提醒事件已就绪")
+        if spoken:
+            await self._start_tts_response(spoken)
 
     async def _send_greeting(self) -> None:
         """按需发送 VSA 问候语。"""

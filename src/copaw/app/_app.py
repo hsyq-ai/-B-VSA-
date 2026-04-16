@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=redefined-outer-name,unused-argument
 import asyncio
+import hashlib
 import os
 import mimetypes
 import time
@@ -43,6 +44,7 @@ from .routers.voice import voice_router
 from .routers.auth import get_current_user
 from .websockets import websocket_manager  # <-- Import the websocket manager
 from .message_queue_store import MessageQueueStore
+from .proactive_event_store import ProactiveEventStore
 from .agent_os_store import AgentOSStore
 from .room_store import RoomStore
 from .artifact_store import ArtifactStore
@@ -217,6 +219,11 @@ async def lifespan(
         logger.debug("MessageQueueStore initialized at %s", WORKING_DIR / "push_messages.db")
     except Exception:
         logger.exception("Failed to initialize MessageQueueStore")
+    try:
+        app.state.proactive_event_store = ProactiveEventStore(WORKING_DIR / "proactive_events.db")
+        logger.debug("ProactiveEventStore initialized at %s", WORKING_DIR / "proactive_events.db")
+    except Exception:
+        logger.exception("Failed to initialize ProactiveEventStore")
     try:
         app.state.agent_os_store = AgentOSStore(
             WORKING_DIR / "agent_os.db",
@@ -751,6 +758,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
 @app.get("/api/messages/pull")
 async def pull_messages(current_user: dict = Depends(get_current_user)):
+    def _build_system_conversation_key(
+        *,
+        source_agent_id: str,
+        source_user_name: str,
+        business_meta: dict[str, str],
+    ) -> str:
+        base = "|".join(
+            [
+                source_agent_id or "system",
+                source_user_name or "系统",
+                business_meta.get("biz_domain", ""),
+                business_meta.get("module", ""),
+                business_meta.get("task_id", ""),
+                business_meta.get("party_item_id", ""),
+            ]
+        )
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+        return f"sys:{digest}"
+
     # JWT payload 使用 user_id，不是 id
     user_id = str(current_user.get("user_id", ""))
     if not user_id:
@@ -831,23 +857,23 @@ async def pull_messages(current_user: dict = Depends(get_current_user)):
                 business_meta["status"] = business_meta["party_status"]
             push_chat_id = str(msg.get("push_chat_id") or "")
             push_session_id = str(msg.get("push_session_id") or "")
-            if not push_session_id:
-                if message_id:
-                    push_session_id = f"console:notif:{message_id}"
-                elif source_user_id:
-                    low, high = sorted([str(user_id), source_user_id])
-                    push_session_id = f"console:dm:{low}:{high}"
-                else:
-                    push_session_id = f"console:notif:{message_id}"
             conversation_key = str(msg.get("push_conversation_key") or "")
             if not conversation_key:
-                if message_id:
-                    conversation_key = f"notif:{message_id}"
-                elif source_user_id:
+                if source_user_id:
                     ids = sorted([str(user_id), source_user_id])
                     conversation_key = f"{ids[0]}:{ids[1]}"
                 else:
-                    conversation_key = f"notif:{message_id}"
+                    conversation_key = _build_system_conversation_key(
+                        source_agent_id=source_agent_id,
+                        source_user_name=source_user_name,
+                        business_meta=business_meta,
+                    )
+            if not push_session_id:
+                if source_user_id:
+                    low, high = sorted([str(user_id), source_user_id])
+                    push_session_id = f"console:dm:{low}:{high}"
+                else:
+                    push_session_id = f"console:notif:{conversation_key}"
             display_name = (
                 f"{source_user_name} ↔ {current_user_name}"
                 if source_user_name and current_user_name
@@ -1034,6 +1060,107 @@ def test_push(current_user: dict = Depends(get_current_user)):
     except Exception:
         logger.exception("Failed to enqueue test message for user %s", user_id)
         return JSONResponse(content={"error": "enqueue failed"}, status_code=500)
+
+
+@app.post("/api/vsa/proactive-events/enqueue")
+def enqueue_vsa_proactive_event(
+    payload: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = str(current_user.get("user_id", ""))
+    if not user_id:
+        return JSONResponse(content={"error": "no user_id"}, status_code=400)
+
+    target_user_id = str(payload.get("user_id") or user_id).strip() or user_id
+    current_role = str(current_user.get("role") or "").strip().lower()
+    if target_user_id != user_id and current_role != "admin":
+        return JSONResponse(content={"error": "forbidden"}, status_code=403)
+
+    store = getattr(app.state, "proactive_event_store", None)
+    if store is None:
+        return JSONResponse(content={"error": "proactive event store unavailable"}, status_code=500)
+
+    event = payload.get("event") if isinstance(payload.get("event"), dict) else dict(payload or {})
+    title = str(event.get("title") or "主动提醒").strip() or "主动提醒"
+    summary = str(event.get("summary") or "").strip()
+    source = str(event.get("source") or "系统").strip() or "系统"
+    level = str(event.get("level") or "light").strip().lower() or "light"
+    urgency = int(event.get("urgency") or 0)
+    relevance = int(event.get("relevance") or 0)
+    actions = event.get("actions") if isinstance(event.get("actions"), list) else []
+
+    normalized_event = {
+        "title": title,
+        "summary": summary,
+        "source": source,
+        "level": level,
+        "urgency": urgency,
+        "relevance": relevance,
+        "actions": [str(item).strip() for item in actions if str(item or "").strip()],
+        "ts": int(time.time() * 1000),
+    }
+    try:
+        inserted = store.enqueue_event(target_user_id, normalized_event)
+        return JSONResponse(
+            content={
+                "ok": True,
+                "deduped": not bool(inserted),
+                "user_id": target_user_id,
+                "event": normalized_event,
+            }
+        )
+    except Exception:
+        logger.exception("Failed to enqueue proactive event for user %s", target_user_id)
+        return JSONResponse(content={"error": "enqueue proactive event failed"}, status_code=500)
+
+
+@app.get("/api/vsa/proactive-events/pull")
+def pull_vsa_proactive_events(current_user: dict = Depends(get_current_user)):
+    user_id = str(current_user.get("user_id", ""))
+    if not user_id:
+        return JSONResponse(content={"events": []})
+    store = getattr(app.state, "proactive_event_store", None)
+    if store is None:
+        return JSONResponse(content={"events": []})
+    try:
+        events = store.pull_events(user_id, limit=20)
+    except Exception:
+        logger.exception("Failed to pull proactive events for user %s", user_id)
+        events = []
+    return JSONResponse(content={"events": events})
+
+
+@app.post("/api/vsa/proactive-events/test")
+def test_vsa_proactive_event(current_user: dict = Depends(get_current_user)):
+    user_id = str(current_user.get("user_id", ""))
+    if not user_id:
+        return JSONResponse(content={"error": "no user_id"}, status_code=400)
+    store = getattr(app.state, "proactive_event_store", None)
+    if store is None:
+        return JSONResponse(content={"error": "proactive event store unavailable"}, status_code=500)
+    sample_event = {
+        "title": "外部快讯提醒",
+        "summary": "你关注的行业出现一条新动态，建议查看是否影响当前任务。",
+        "source": "新闻订阅",
+        "level": "light",
+        "urgency": 3,
+        "relevance": 4,
+        "actions": ["立即处理", "稍后提醒", "静默归档"],
+        "ts": int(time.time() * 1000),
+    }
+    try:
+        inserted = store.enqueue_event(user_id, sample_event)
+        return JSONResponse(
+            content={
+                "ok": True,
+                "deduped": not bool(inserted),
+                "user_id": user_id,
+                "event": sample_event,
+            }
+        )
+    except Exception:
+        logger.exception("Failed to enqueue proactive test event for user %s", user_id)
+        return JSONResponse(content={"error": "enqueue proactive test failed"}, status_code=500)
 
 
 app.include_router(api_router, prefix="/api")

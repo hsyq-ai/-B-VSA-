@@ -22,6 +22,16 @@ interface UseVoiceSecretaryOptions {
   userName?: string;
 }
 
+interface VoiceSecretaryProactiveEvent {
+  title?: string;
+  summary?: string;
+  source?: string;
+  level?: "strong" | "light" | "silent";
+  urgency?: number;
+  relevance?: number;
+  actions?: string[];
+}
+
 const buildVoiceSecretaryWsUrl = (userId: string) => {
   const token = getApiToken();
   const apiUrl = getApiUrl("/");
@@ -71,6 +81,9 @@ const mapAssistantPhaseToStatusText = (phase: string, fallbackText: string) => {
   }
   if (normalized === "synthesizing") {
     return { status: "speaking" as const, text: "语音秘书正在合成语音..." };
+  }
+  if (normalized === "proactive_notify") {
+    return { status: "processing" as const, text: "正在整理主动提醒..." };
   }
   return {
     status: "processing" as const,
@@ -858,6 +871,26 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
     await start();
   }, [start, stop]);
 
+  const notifyProactive = useCallback((event: VoiceSecretaryProactiveEvent) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(
+      JSON.stringify({
+        type: "proactive_event",
+        event: {
+          title: String(event?.title || "").trim(),
+          summary: String(event?.summary || "").trim(),
+          source: String(event?.source || "").trim(),
+          level: String(event?.level || "light").trim(),
+          urgency: Number(event?.urgency || 0),
+          relevance: Number(event?.relevance || 0),
+          actions: Array.isArray(event?.actions) ? event.actions : [],
+        },
+      }),
+    );
+    return true;
+  }, []);
+
   useEffect(() => {
     if (!enabled) {
       manualCloseRef.current = true;
@@ -900,5 +933,6 @@ export function useVoiceSecretary({ enabled, userId }: UseVoiceSecretaryOptions)
     start,
     stop,
     reconnect,
+    notifyProactive,
   };
 }

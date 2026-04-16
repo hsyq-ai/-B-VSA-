@@ -37,6 +37,48 @@ type DockInboxItem = InboxItem & {
 
 type PushEventDetail = {
   count?: number;
+  messageCount?: number;
+  proactiveCount?: number;
+  samples?: Array<{
+    text?: string;
+    intentType?: string;
+    source?: string;
+  }>;
+  proactiveEvents?: Array<{
+    title?: string;
+    summary?: string;
+    source?: string;
+    level?: string;
+    urgency?: number;
+    relevance?: number;
+    actions?: string[];
+    ts?: number;
+  }>;
+};
+
+type ProactiveLevel = "strong" | "light" | "silent";
+
+type ProactiveNotice = {
+  id: string;
+  title: string;
+  summary: string;
+  source: string;
+  level: ProactiveLevel;
+  count: number;
+  urgency: number;
+  relevance: number;
+  createdAt: number;
+};
+
+type ProactiveScoreInput = {
+  count: number;
+  samples: Array<{
+    text: string;
+    intentType: string;
+    source: string;
+  }>;
+  hour: number;
+  speakingBusy: boolean;
 };
 
 type ActiveVoiceTaskHandoff = {
@@ -126,6 +168,45 @@ const resolveInboxSourceTag = (meta: Record<string, unknown>) => {
   return "系统";
 };
 
+const PROACTIVE_URGENT_PATTERN = /(紧急|马上|尽快|超时|告警|失败|异常|逾期|截止|立刻|asap)/i;
+const PROACTIVE_BOSS_PATTERN = /(总裁|总经理|董事长|领导|老板|张总|李总|王总|刘总)/i;
+
+const clampScore = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+const scoreProactiveLevel = (input: ProactiveScoreInput): { level: ProactiveLevel; urgency: number; relevance: number } => {
+  let urgency = input.count >= 3 ? 3 : input.count >= 1 ? 2 : 1;
+  let relevance = input.count >= 1 ? 2 : 1;
+
+  input.samples.forEach((item) => {
+    if (PROACTIVE_URGENT_PATTERN.test(item.text)) {
+      urgency += 2;
+    }
+    if (item.intentType.includes("task") || item.intentType.includes("notify")) {
+      urgency += 1;
+      relevance += 1;
+    }
+    if (PROACTIVE_BOSS_PATTERN.test(item.source) || PROACTIVE_BOSS_PATTERN.test(item.text)) {
+      relevance += 2;
+    }
+  });
+
+  let disturbanceCost = 0;
+  if (input.hour < 8 || input.hour >= 22) {
+    disturbanceCost += 2;
+  }
+  if (input.speakingBusy) {
+    disturbanceCost += 2;
+  }
+
+  urgency = clampScore(urgency, 1, 5);
+  relevance = clampScore(relevance, 1, 5);
+  const decisionScore = urgency * 1.2 + relevance - disturbanceCost;
+
+  if (decisionScore >= 6) return { level: "strong", urgency, relevance };
+  if (decisionScore >= 3) return { level: "light", urgency, relevance };
+  return { level: "silent", urgency, relevance };
+};
+
 const buildDockInboxItems = (sessions: any[]): DockInboxItem[] =>
   (sessions || [])
     .filter((session) => {
@@ -174,6 +255,7 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
     lastResult: voiceLastResult,
     start: voiceStart,
     stop: voiceStop,
+    notifyProactive: voiceNotifyProactive,
   } = useVoiceSecretary({ enabled: voiceActive, userId: currentUserId, userName: currentUserName });
   // voiceSupported 供未来 Dock 内语音按钮使用
   void voiceSupported;
@@ -236,6 +318,7 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
   const handledVoiceTaskKeyRef = useRef("");
   const activeVoiceTaskRef = useRef<ActiveVoiceTaskHandoff | null>(null);
   const voiceTaskStatusTimerRef = useRef<number | null>(null);
+  const proactiveRemindTimerRef = useRef<number | null>(null);
 
   const [panelOpen, setPanelOpen] = useState<boolean>(getStoredDockOpen);
   const [feedExpanded, setFeedExpanded] = useState(false);
@@ -248,6 +331,7 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
   const [inboxItems, setInboxItems] = useState<DockInboxItem[]>([]);
   const [unreadPushCount, setUnreadPushCount] = useState(0);
   const [latestPushCount, setLatestPushCount] = useState(0);
+  const [proactiveNotice, setProactiveNotice] = useState<ProactiveNotice | null>(null);
   const statusMeta = useMemo(() => {
     if (processingText && /未完成|失败|错误|重试/.test(processingText)) {
       return { color: "#ef4444", label: "当前请求未完成" };
@@ -533,6 +617,136 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
     }
   }, []);
 
+  const emitProactiveVoiceReminder = useCallback(
+    (notice: ProactiveNotice) => {
+      if (!voiceActive || !voiceConnected || notice.level === "silent") return;
+      voiceNotifyProactive({
+        title: notice.title,
+        summary: notice.summary,
+        source: notice.source,
+        level: notice.level,
+        urgency: notice.urgency,
+        relevance: notice.relevance,
+        actions: ["立即处理", "稍后提醒", "静默归档"],
+      });
+    },
+    [voiceActive, voiceConnected, voiceNotifyProactive],
+  );
+
+  const showProactiveNotice = useCallback(
+    (detail: PushEventDetail) => {
+      const proactiveEvents = Array.isArray(detail.proactiveEvents) ? detail.proactiveEvents : [];
+      if (proactiveEvents.length > 0) {
+        const raw = proactiveEvents[0] || {};
+        const notice: ProactiveNotice = {
+          id: `proactive-${Date.now()}`,
+          title: String(raw.title || "主动提醒").trim() || "主动提醒",
+          summary: String(raw.summary || "").trim() || "你有一条新的主动提醒。",
+          source: String(raw.source || "系统").trim() || "系统",
+          level: (["strong", "light", "silent"].includes(String(raw.level || "").trim().toLowerCase())
+            ? String(raw.level || "").trim().toLowerCase()
+            : "light") as ProactiveLevel,
+          count: Math.max(1, proactiveEvents.length),
+          urgency: Math.max(1, Math.min(5, Number(raw.urgency || 3))),
+          relevance: Math.max(1, Math.min(5, Number(raw.relevance || 3))),
+          createdAt: Number(raw.ts || Date.now()),
+        };
+        if (notice.level === "silent") {
+          setProcessingText("收到新的主动提醒，已静默汇总");
+          setProactiveNotice(null);
+          return;
+        }
+        setProactiveNotice(notice);
+        emitProactiveVoiceReminder(notice);
+        return;
+      }
+
+      const safeCount = Math.max(1, Number(detail.count || 1));
+      const samples = Array.isArray(detail.samples)
+        ? detail.samples.map((item) => ({
+            text: String(item?.text || "").trim(),
+            intentType: String(item?.intentType || "").trim().toLowerCase(),
+            source: String(item?.source || "").trim(),
+          }))
+        : [];
+      const hour = new Date().getHours();
+      const speakingBusy = voiceStatus === "processing" || voiceStatus === "speaking";
+      const scoreResult = scoreProactiveLevel({
+        count: safeCount,
+        samples,
+        hour,
+        speakingBusy,
+      });
+      const firstText = samples.find((item) => item.text)?.text || "";
+      const summary =
+        firstText ||
+        (safeCount > 1
+          ? `刚收到 ${safeCount} 条新消息，建议优先处理。`
+          : "刚收到 1 条新消息，是否现在交给秘书处理？");
+      const notice: ProactiveNotice = {
+        id: `proactive-${Date.now()}`,
+        title: safeCount > 1 ? "收到多条新消息" : "收到新消息",
+        summary,
+        source: "消息中心",
+        level: scoreResult.level,
+        count: safeCount,
+        urgency: scoreResult.urgency,
+        relevance: scoreResult.relevance,
+        createdAt: Date.now(),
+      };
+      if (notice.level === "silent") {
+        setProcessingText(`收到 ${safeCount} 条新消息，已静默汇总`);
+        setProactiveNotice(null);
+        return;
+      }
+      setProactiveNotice(notice);
+      emitProactiveVoiceReminder(notice);
+    },
+    [emitProactiveVoiceReminder, voiceStatus],
+  );
+
+  const handleSnoozeProactiveNotice = useCallback(() => {
+    const current = proactiveNotice;
+    if (!current) return;
+    if (proactiveRemindTimerRef.current) {
+      window.clearTimeout(proactiveRemindTimerRef.current);
+      proactiveRemindTimerRef.current = null;
+    }
+    const remindText = "已设置稍后提醒，10 分钟后再提醒你。";
+    setProcessingText(remindText);
+    setProactiveNotice(null);
+    proactiveRemindTimerRef.current = window.setTimeout(() => {
+      const resumed: ProactiveNotice = {
+        ...current,
+        id: `proactive-${Date.now()}`,
+        summary: `这是稍后提醒：你还有 ${current.count} 条消息待处理。`,
+        level: "light",
+        createdAt: Date.now(),
+      };
+      setProactiveNotice(resumed);
+      emitProactiveVoiceReminder(resumed);
+    }, 10 * 60 * 1000);
+  }, [emitProactiveVoiceReminder, proactiveNotice]);
+
+  const handleDismissProactiveNotice = useCallback(() => {
+    setProactiveNotice(null);
+    setProcessingText("已静默归档本次提醒");
+  }, []);
+
+  const handleProcessProactiveNotice = useCallback(() => {
+    const target = latestInboxItems[0];
+    if (!target) {
+      setProactiveNotice(null);
+      setProcessingText("暂无可处理消息，已归档提醒");
+      return;
+    }
+    setProactiveNotice(null);
+    void queueSecretaryPrompt(
+      buildInboxFollowupPrompt(target, currentUserName),
+      buildInboxFollowupProcessingText(target),
+    );
+  }, [currentUserName, latestInboxItems, queueSecretaryPrompt]);
+
   const openPanel = useCallback(() => {
     setPanelOpen(true);
     setUnreadPushCount(0);
@@ -685,6 +899,9 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
       if (voiceTaskStatusTimerRef.current) {
         window.clearTimeout(voiceTaskStatusTimerRef.current);
       }
+      if (proactiveRemindTimerRef.current) {
+        window.clearTimeout(proactiveRemindTimerRef.current);
+      }
     };
   }, [stopHandoffRetryLoop]);
 
@@ -692,17 +909,23 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
     void loadInbox();
     const handlePushUpdated = (event: Event) => {
       const detail = ((event as CustomEvent<PushEventDetail>)?.detail || {}) as PushEventDetail;
-      const count = Math.max(1, Number(detail.count || 0));
-      setUnreadPushCount((prev) => Math.min(99, prev + count));
-      setLatestPushCount(count);
+      const messageCount = Math.max(0, Number(detail.messageCount ?? detail.count ?? 0));
+      const proactiveCount = Math.max(0, Number(detail.proactiveCount || 0));
+      if (messageCount > 0) {
+        setUnreadPushCount((prev) => Math.min(99, prev + messageCount));
+      }
+      if (messageCount > 0 || proactiveCount > 0) {
+        setLatestPushCount(messageCount + proactiveCount);
+      }
       setFeedExpanded(true);
       void loadInbox();
+      showProactiveNotice(detail);
     };
     window.addEventListener("copaw-push-session-updated", handlePushUpdated);
     return () => {
       window.removeEventListener("copaw-push-session-updated", handlePushUpdated);
     };
-  }, [loadInbox]);
+  }, [loadInbox, showProactiveNotice]);
 
   useEffect(() => {
     const handleFrameMessage = (event: MessageEvent) => {
@@ -916,6 +1139,40 @@ export default function FloatingAiDock({ selectedKey, currentPath }: FloatingAiD
 
               {feedExpanded ? (
                 <div className={styles.feedBody}>
+                  {proactiveNotice ? (
+                    <div className={styles.feedBlock}>
+                      <div className={styles.feedBlockHeader}>
+                        <span className={styles.feedBlockTitle}>主动提醒</span>
+                        <Space size={[8, 8]} wrap>
+                          <Tag color={proactiveNotice.level === "strong" ? "red" : proactiveNotice.level === "light" ? "gold" : "default"} style={{ marginInlineEnd: 0, borderRadius: 999 }}>
+                            {proactiveNotice.level === "strong" ? "强提醒" : proactiveNotice.level === "light" ? "轻提醒" : "静默"}
+                          </Tag>
+                          <Tag style={{ marginInlineEnd: 0, borderRadius: 999 }}>紧急度 {proactiveNotice.urgency}</Tag>
+                          <Tag style={{ marginInlineEnd: 0, borderRadius: 999 }}>相关度 {proactiveNotice.relevance}</Tag>
+                          <Tag style={{ marginInlineEnd: 0, borderRadius: 999 }}>{getRelativeTimeLabel(proactiveNotice.createdAt)}</Tag>
+                        </Space>
+                      </div>
+                      <div className={styles.inboxItemCard}>
+                        <div className={styles.inboxItemTop}>
+                          <div className={styles.inboxItemTitle}>{proactiveNotice.title}</div>
+                          <Tag style={{ marginInlineEnd: 0, borderRadius: 999 }}>{proactiveNotice.source}</Tag>
+                        </div>
+                        <div className={styles.inboxItemMeta}>{proactiveNotice.summary}</div>
+                        <div className={styles.inboxItemActions}>
+                          <Button size="small" type="primary" onClick={handleProcessProactiveNotice}>
+                            立即处理
+                          </Button>
+                          <Button size="small" onClick={handleSnoozeProactiveNotice}>
+                            稍后提醒
+                          </Button>
+                          <Button size="small" onClick={handleDismissProactiveNotice}>
+                            静默归档
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+
                   <div className={styles.feedBlock}>
                     <div className={styles.feedBlockHeader}>
                       <span className={styles.feedBlockTitle}>最新消息</span>
